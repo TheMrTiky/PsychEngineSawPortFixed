@@ -100,7 +100,7 @@ class WebmPlayerS extends FlxSprite
 		    cameras = [cam];
 		}
 
-                setGraphicSize(FlxG.width)
+                setGraphicSize(FlxG.width);
                 updateHitbox();
                 play();
     }
