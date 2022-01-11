@@ -1,257 +1,278 @@
-package;
+package webm;
 
-//This made by Sirox for using with whatever you want
-import haxe.crypto.Md5;
-import openfl.utils.Assets;
-import webm.*;
-import flixel.system.FlxSound;
-import flixel.FlxCamera;
-import openfl.Assets;
+import cpp.Lib;
+import haxe.io.Bytes;
+import haxe.io.BytesData;
+import openfl.display.Bitmap;
+import openfl.display.BitmapData;
+import openfl.display.PixelSnapping;
+import openfl.events.Event;
+import openfl.events.SampleDataEvent;
 import openfl.media.Sound;
-import flixel.FlxSprite;
-import flixel.FlxG;
-import openfl.Lib;
-#if sys
-import sys.FileSystem;
-import sys.io.File;
-import Sys;
-#end
+import openfl.media.SoundChannel;
+import openfl.utils.ByteArray;
+import openfl.utils.Endian;
 
-using StringTools;
+using Std;
 
-class WebmPlayerS extends FlxSprite
+class WebmPlayer extends Bitmap
 {
-	public var videoplayer:WebmPlayer;
-	public var endcallback:Void->Void = null;
-	public var startcallback:Void->Void = null;
-	public var sound:FlxSound;
-    public var soundMultiplier:Float = 1;
-    public var prevSoundMultiplier:Float = 1;
-    public var videoFrames:Int = 0;
-    public var doShit:Bool = false;
-    public var io:WebmIo;
-    public var altSource:String;
-    
-    public var stopped:Bool = false;
-	public var restarted:Bool = false;
-	public var started:Bool = false;
-	public var ended:Bool = false;
-	public var paused:Bool = false;
-	
-	public var useSound:Bool = false;
-	
-	public function new(source:String, ownCamera:Bool = false, frameSkipLimit:Int = -1, okX:Float = null, okY:Float = null, okWidth:Float = null, okHeight:Float = null) 
-    {
-    	x = 0;
-        y = 0;
+	static inline var BYTES_PER_SAMPLE = 4 * 8192;
+	static var BLANK_BYTES:ByteArray;
+	public var SKIP_STEP_LIMIT = 0;
 
-    	if (okX != null) {
-        	x = okX;
-        }
-        if (okY != null) {
-        	y = okY;
-        }
-        if (okWidth != null) {
-        	width = okWidth;
-        }
-        if (okHeight != null) {
-        	height = okHeight;
-        }
+	public var frameRate(default, null):Float;
+	public var duration(default, null):Float;
 
-        super(x, y);
-        
-        altSource = source;
-        
-        useSound = Assets.exists(altSource.replace(".webm", ".txt")) && Assets.exists(altSource.replace(".webm", ".ogg"));
-        
-        if (useSound) {
-            videoFrames = Std.parseInt(Assets.getText(altSource.replace(".webm", ".txt")));
-        }
-        
-        io = new WebmIoFile(getThing(altSource));
-		videoplayer = new WebmPlayer();
-		videoplayer.fuck(io, false);
-		videoplayer.addEventListener(WebmEvent.PLAY, function(e) {
-			trace("playing");
-			if (startcallback != null) {
-				startcallback();
-			}
-			started = true;
-		});
-		videoplayer.addEventListener(WebmEvent.COMPLETE, function(e) {
-			trace("ended");
-			if (endcallback != null) {
-				endcallback();
-			}
-			ended = true;
-		});
-		videoplayer.addEventListener(WebmEvent.STOP, function(e) {
-			trace("stopped");
-			stopped = true;
-		});
-		videoplayer.addEventListener(WebmEvent.RESTART, function(e) {
-			trace("restarted");
-			restarted = true;
-		});
-		
-		loadGraphic(videoplayer.bitmapData);
-		
-		if (useSound) {
-		    sound = FlxG.sound.play(altSource.replace(".webm", ".ogg"));
-		    sound.time = sound.length * soundMultiplier;
-		    doShit = true;
-		}
-        
-        if (frameSkipLimit != -1)
+	var vpxDecoder:VpxDecoder;
+	var webmDecoder:Dynamic;
+	var outputSound:ByteArray;
+	var soundChannel:SoundChannel;
+	var sound:Sound;
+	var soundEnabled:Bool;
+	var skippedSteps = 0;
+	
+	var startTime = 0.0;
+	var lastDecodedVideoFrame = 0.0;
+	var lastRequestedVideoFrame = 0.0;
+	var playing = false;
+	public var renderedCount = 0;
+	var renderedCount2 = 0;
+	var lastDecodedVideoFrame2 = 0.0;
+	var fkingElapsed = 0.0;
+	public var wasHitOnce = false;
+	
+	public function new()
+	{
+	super(null);
+	}
+
+	public function fuck(io:WebmIo, soundEnabled:Bool = true):Void
+	{
+		wasHitOnce = false;
+		this.soundEnabled = soundEnabled;
+
+		if (BLANK_BYTES == null)
 		{
-			videoplayer.SKIP_STEP_LIMIT = frameSkipLimit;	
+			BLANK_BYTES = new ByteArray();
+			for (i in 0...BYTES_PER_SAMPLE)
+				BLANK_BYTES.writeByte(0);
 		}
+
+		pixelSnapping = PixelSnapping.AUTO;
+		smoothing = true;
+
+		vpxDecoder = new VpxDecoder();
+
+		webmDecoder = hx_webm_decoder_create(io.io, soundEnabled);
 		
-		if (ownCamera) {
-		    var cam = new FlxCamera();
-	        FlxG.cameras.add(cam);
-		    cam.bgColor.alpha = 0;
-		    cameras = [cam];
-		}
-    }
-    
-    public function getThing(source:String)
-    {
-    	#if mobile
-        return AndroidThing.getPath(source);
-        #elseif desktop
-        return Sys.getCwd() + source;
-        #else
-        return null;
-        #end
-    }
-	
-	public function play():Void
-	{
-		videoplayer.play();
-	}
-	
-	public function stop():Void
-	{
-		videoplayer.stop();
-	}
-	
-	public function restart():Void
-	{
-		videoplayer.restart();
-	}
-	
-	public function togglePause():Void
-	{
-		if (paused)
+		var info = hx_webm_decoder_get_info(webmDecoder);
+		bitmapData = new BitmapData(info[0].int(), info[1].int(), false, 0);
+		frameRate = info[2];
+		duration = info[3];
+
+		if (soundEnabled)
 		{
-			resume();
+			outputSound = new ByteArray();
+			outputSound.endian = Endian.LITTLE_ENDIAN;
+		}
+	}
+
+	public function generateSound(e:SampleDataEvent)
+	{
+		if (e.data == null)
+			e.data = new ByteArray();
+
+		var totalOutputLength = outputSound.length;
+		var outputBytesToWrite = Math.min(totalOutputLength, BYTES_PER_SAMPLE).int();
+		var blankBytesToWrite = BYTES_PER_SAMPLE - outputBytesToWrite;
+
+		if (blankBytesToWrite > 0)
+			e.data.writeBytes(BLANK_BYTES, 0, blankBytesToWrite);
+
+		if (outputBytesToWrite > 0)
+		{
+			e.data.writeBytes(outputSound, 0, outputBytesToWrite);
+
+			if (outputBytesToWrite < totalOutputLength)
+			{
+				var remainingBytes = new ByteArray();
+				remainingBytes.writeBytes(outputSound, outputBytesToWrite);
+				outputSound = remainingBytes;
+			}
+			else
+			{
+				outputSound.clear();
+			}
+		}
+	}
+	
+	public function getElapsedTime():Float
+	{
+		return haxe.Timer.stamp() - startTime;
+	}
+	
+	public function elapsedTimeDiff():Float
+	{
+		return getElapsedTime() - fkingElapsed;
+	}
+	
+	public function removePause():Void
+	{
+		lastDecodedVideoFrame2 = 0.0;
+		renderedCount2 = 0;
+	}
+	
+	public function restart()
+	{
+		stop(true);
+		renderedCount = 0;
+		lastDecodedVideoFrame = 0;
+		hx_webm_decoder_restart(webmDecoder);
+		this.dispatchEvent(new Event(WebmEvent.RESTART));
+		play();
+	}
+	
+	public function changePlaying(isPlay:Bool)
+	{
+		this.dispatchEvent(new Event(WebmEvent.RESTART));
+		if (!isPlay)
+		{
+			playing = false;
+			renderedCount2 = renderedCount;
+			lastDecodedVideoFrame2 = lastDecodedVideoFrame;
+			renderedCount = 0;
+			lastDecodedVideoFrame = 0;
 		} else {
-			pause();
+			renderedCount = renderedCount2;
+			lastDecodedVideoFrame = lastDecodedVideoFrame2;
+			startTime += elapsedTimeDiff();
+			playing = true;
+			dispatchEvent(new WebmEvent(WebmEvent.PLAY));
 		}
 	}
 	
-	public function clearPause():Void
+	public function play()
 	{
-		paused = false;
-		videoplayer.removePause();
-	}
-	
-	public function pause():Void
-	{
-		videoplayer.changePlaying(false);
-		paused = true;
-	}
-	
-	public function resume():Void
-	{
-		videoplayer.changePlaying(true);
-		paused = false;
-	}
-	
-	public function setAlpha(ok:Float):Void
-	{
-		videoplayer.alpha = ok;
-	}
-	
-	override public function update(elapsed:Float)
-	{
-		super.update(elapsed);
-		
-		if (useSound)
+		if (!playing)
 		{
-			var wasFuckingHit = videoplayer.wasHitOnce;
-			soundMultiplier = videoplayer.renderedCount / videoFrames;
-			
-			if (soundMultiplier > 1)
+			startTime = haxe.Timer.stamp();
+
+			if (soundEnabled)
 			{
-				soundMultiplier = 1;
+				sound = new Sound();
+				sound.addEventListener(SampleDataEvent.SAMPLE_DATA, generateSound);
+				soundChannel = sound.play();
 			}
-			if (soundMultiplier < 0)
+		
+			addEventListener(Event.ENTER_FRAME, onSpriteEnterFrame);
+			playing = true;
+			dispatchEvent(new WebmEvent(WebmEvent.PLAY));
+		}
+	}
+
+	public function stop(?pRestart:Bool = false)
+	{
+		if (playing)
+		{
+			if (soundEnabled)
 			{
-				soundMultiplier = 0;
+				this.sound.removeEventListener(SampleDataEvent.SAMPLE_DATA, generateSound);
+				this.sound.close();
 			}
-			if (doShit)
-			{
-				var compareShit:Float = 50;
-				if (sound.time >= (sound.length * soundMultiplier) + compareShit || sound.time <= (sound.length * soundMultiplier) - compareShit)
-					sound.time = sound.length * soundMultiplier;
-			}
-			if (wasFuckingHit)
-			{
-			if (soundMultiplier == 0)
-			{
-				if (prevSoundMultiplier != 0)
-				{
-					sound.pause();
-					sound.time = 0;
-				}
-			} else {
-				if (prevSoundMultiplier == 0)
-				{
-					sound.resume();
-					sound.time = sound.length * soundMultiplier;
-				}
-			}
-			prevSoundMultiplier = soundMultiplier;
-			}
+			playing = false;
+			if (!pRestart) dispatchEvent(new WebmEvent(WebmEvent.STOP));
+			dispose();
 		}
 	}
 	
-	override public function destroy() {
-        videoplayer.stop();
-        super.destroy();
-    }
-}
-
-class Dimensions
-{
-	public static var width:Int = 1280;
-	public static var height:Int = 720;
-}
-
-class AndroidThing
-{
-	#if android
-	static var path:String = lime.system.System.applicationStorageDirectory;
-	#end
-
-	public static function getPath(id:String)
+	function onSpriteEnterFrame(e:Event)
 	{
-		#if android
-		var file = Assets.getBytes(id);
-
-		var md5 = Md5.encode(Md5.make(file).toString());
-
-		if (FileSystem.exists(path + md5))
-			return path + md5;
-
-
-		File.saveBytes(path + md5, file);
-
-		return path + md5;
-		#else
-		return null;
-		#end
+		skippedSteps = 0;
+		stepVideoFrame();
 	}
+	
+	function stepVideoFrame()
+	{
+		if (playing)
+		{
+		wasHitOnce = true;
+		var startRenderedCount = renderedCount;
+		var elapsedTime = getElapsedTime ();
+		fkingElapsed = elapsedTime;
+
+		while (hx_webm_decoder_has_more(webmDecoder) && lastDecodedVideoFrame < elapsedTime)
+		{
+			lastRequestedVideoFrame = elapsedTime;
+			hx_webm_decoder_step(webmDecoder, decodeVideoFrame, outputAudioFrame);
+			if (renderedCount > startRenderedCount) break;
+		}
+		
+		if (!hx_webm_decoder_has_more(webmDecoder))
+		{
+			dispatchEvent(new WebmEvent(WebmEvent.COMPLETE));
+			stop();
+		}
+		}
+	}
+
+	function decodeVideoFrame(time:Float, data:BytesData)
+	{
+		if (playing)
+		{
+		lastDecodedVideoFrame = time;
+		++renderedCount;
+		
+		vpxDecoder.decode(data);
+		
+		if (skippedSteps < SKIP_STEP_LIMIT && playing && lastDecodedVideoFrame < lastRequestedVideoFrame)
+		{
+			skippedSteps++;
+			stepVideoFrame();
+		}
+		else
+		{
+			vpxDecoder.getAndRenderFrame(bitmapData);
+		}
+		} else {
+		vpxDecoder.getAndRenderFrame(bitmapData);
+		}
+	}
+	
+	function outputAudioFrame(time:Float, data:BytesData)
+	{
+		if (!soundEnabled) return;
+		outputSound.position = outputSound.length;
+		outputSound.writeBytes(ByteArray.fromBytes(Bytes.ofData(data)));
+		outputSound.position = 0;
+	}
+	
+	function dispose()
+	{
+		removeEventListener(Event.ENTER_FRAME, onSpriteEnterFrame);
+		
+		if (sound != null)
+		{
+			sound.removeEventListener(SampleDataEvent.SAMPLE_DATA, generateSound);
+			sound = null;
+		}
+		
+		if (soundChannel != null)
+		{
+			soundChannel.stop();
+			soundChannel = null;
+		}
+		
+		if (bitmapData != null)
+		{
+			bitmapData.dispose();
+			bitmapData = null;
+		}
+	}
+	
+	static var hx_webm_decoder_create:Dynamic -> Bool -> Dynamic = Lib.load("extension-webm", "hx_webm_decoder_create", 2);
+	static var hx_webm_decoder_get_info:Dynamic -> Array<Float> = Lib.load("extension-webm", "hx_webm_decoder_get_info", 1);
+	static var hx_webm_decoder_has_more:Dynamic -> Bool = Lib.load("extension-webm", "hx_webm_decoder_has_more", 1);
+	static var hx_webm_decoder_step = Lib.load("extension-webm", "hx_webm_decoder_step", 3);
+	static var hx_webm_decoder_restart = Lib.load("extension-webm", "hx_webm_decoder_restart", 1);
 }
